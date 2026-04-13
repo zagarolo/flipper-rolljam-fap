@@ -19,8 +19,53 @@
 #include <lib/subghz/subghz_tx_rx_worker.h>
 
 #include "helpers/radio_device_loader.h"
+#include <extra_beacon.h>
 
 #define TAG "RollJam"
+
+/* Beacon RollJam: payload mfg_data per controllo Pi Zero remoto.
+ * Magic 4-byte header "RJ01" + 1 byte stato (0=OFF, 1=ON_433, 2=ON_868) */
+#define RJ_BEACON_MAGIC0 0x52  /* 'R' */
+#define RJ_BEACON_MAGIC1 0x4A  /* 'J' */
+#define RJ_BEACON_MAGIC2 0x30  /* '0' */
+#define RJ_BEACON_MAGIC3 0x31  /* '1' */
+#define RJ_BEACON_STATE_OFF     0x00
+#define RJ_BEACON_STATE_ON_433  0x01
+#define RJ_BEACON_STATE_ON_868  0x02
+
+static void rj_beacon_set(uint8_t state) {
+    GapExtraBeaconConfig cfg = {
+        .min_adv_interval_ms = 100,
+        .max_adv_interval_ms = 200,
+        .adv_channel_map = GapAdvChannelMapAll,
+        .adv_power_level = GapAdvPowerLevel_0dBm,
+        .address_type = GapAddressTypePublic,
+        .address = {0x52, 0x4A, 0x01, 0x02, 0x03, 0x04}, /* RJ marker */
+    };
+    uint8_t data[5] = {
+        RJ_BEACON_MAGIC0, RJ_BEACON_MAGIC1,
+        RJ_BEACON_MAGIC2, RJ_BEACON_MAGIC3,
+        state
+    };
+    if(furi_hal_bt_extra_beacon_is_active()) {
+        furi_hal_bt_extra_beacon_stop();
+    }
+    furi_hal_bt_extra_beacon_set_config(&cfg);
+    furi_hal_bt_extra_beacon_set_data(data, sizeof(data));
+    furi_hal_bt_extra_beacon_start();
+}
+
+static void rj_beacon_off(void) {
+    if(furi_hal_bt_extra_beacon_is_active()) {
+        uint8_t data[5] = {RJ_BEACON_MAGIC0, RJ_BEACON_MAGIC1,
+                           RJ_BEACON_MAGIC2, RJ_BEACON_MAGIC3,
+                           RJ_BEACON_STATE_OFF};
+        furi_hal_bt_extra_beacon_set_data(data, sizeof(data));
+        /* stop after a brief notify so Pi Zero scanner sees OFF */
+        furi_delay_ms(300);
+        furi_hal_bt_extra_beacon_stop();
+    }
+}
 
 #define ROLLJAM_LAST_SUB        EXT_PATH("subghz/rolljam/last.sub")
 #define ROLLJAM_STORAGE_DIR     EXT_PATH("subghz/rolljam")
@@ -276,6 +321,8 @@ static void jam_off(RollJamApp* app);
 
 static void radio_deinit_attack(RollJamApp* app) {
     log_add("radio_deinit START");
+    rj_beacon_off();  /* segnale a Pi Zero: jam OFF */
+    log_add("BEACON OFF");
     jam_off(app);
     log_add("jam_off OK");
     /* Full release: worker_stop lascia device inusabile.
@@ -497,6 +544,8 @@ done:
 
 static bool run_attack(RollJamApp* app) {
     log_add("=== ATTACK START ===");
+    rj_beacon_set(RJ_BEACON_STATE_ON_433);  /* segnale a Pi Zero: jam ON 433 MHz */
+    log_add("BEACON ON_433");
     app->should_abort = false;
     app->jam_count = 0;
 
