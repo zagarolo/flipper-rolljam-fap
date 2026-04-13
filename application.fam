@@ -1,0 +1,14 @@
+App(
+    appid="rolljam_dual",
+    name="RollJam Dual",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="rolljam_app",
+    requires=["gui", "subghz"],
+    stack_size=8 * 1024,
+    fap_category="Sub-GHz",
+    fap_version="1.0",
+    fap_icon="rolljam.png",
+    fap_description="RollJam dual-radio — external CC1101 board support",
+    fap_author="pentest lab",
+    fap_icon_assets="images",
+)
