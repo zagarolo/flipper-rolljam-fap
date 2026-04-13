@@ -35,14 +35,18 @@
 
 static void rj_beacon_set(uint8_t state) {
     GapExtraBeaconConfig cfg = {
-        .min_adv_interval_ms = 100,
-        .max_adv_interval_ms = 200,
+        .min_adv_interval_ms = 50,
+        .max_adv_interval_ms = 100,
         .adv_channel_map = GapAdvChannelMapAll,
         .adv_power_level = GapAdvPowerLevel_0dBm,
-        .address_type = GapAddressTypePublic,
-        .address = {0x52, 0x4A, 0x01, 0x02, 0x03, 0x04}, /* RJ marker */
+        .address_type = GapAddressTypeRandom,  /* Random richiesto per MAC custom */
+        .address = {0x52, 0x4A, 0x01, 0x02, 0x03, 0xC0}, /* RJ marker — MSB 0xC0 = static random */
     };
-    uint8_t data[5] = {
+    /* Formato BLE AD element — manufacturer specific data (company 0xFFFF test) */
+    uint8_t data[] = {
+        0x08,        /* length = 1 type + 2 company + 4 magic + 1 state = 8 */
+        0xFF,        /* AD type: Manufacturer Specific Data */
+        0xFF, 0xFF,  /* Company ID 0xFFFF (reserved for test) */
         RJ_BEACON_MAGIC0, RJ_BEACON_MAGIC1,
         RJ_BEACON_MAGIC2, RJ_BEACON_MAGIC3,
         state
@@ -50,20 +54,29 @@ static void rj_beacon_set(uint8_t state) {
     if(furi_hal_bt_extra_beacon_is_active()) {
         furi_hal_bt_extra_beacon_stop();
     }
-    furi_hal_bt_extra_beacon_set_config(&cfg);
-    furi_hal_bt_extra_beacon_set_data(data, sizeof(data));
-    furi_hal_bt_extra_beacon_start();
+    /* furi_check: se una chiamata fallisce, panic+log visibile */
+    furi_check(furi_hal_bt_extra_beacon_set_config(&cfg));
+    furi_check(furi_hal_bt_extra_beacon_set_data(data, sizeof(data)));
+    furi_check(furi_hal_bt_extra_beacon_start());
+    /* log_add chiamato dopo dal caller (log_add è static declared più avanti) */
 }
 
 static void rj_beacon_off(void) {
     if(furi_hal_bt_extra_beacon_is_active()) {
-        uint8_t data[5] = {RJ_BEACON_MAGIC0, RJ_BEACON_MAGIC1,
-                           RJ_BEACON_MAGIC2, RJ_BEACON_MAGIC3,
-                           RJ_BEACON_STATE_OFF};
-        furi_hal_bt_extra_beacon_set_data(data, sizeof(data));
-        /* stop after a brief notify so Pi Zero scanner sees OFF */
-        furi_delay_ms(300);
-        furi_hal_bt_extra_beacon_stop();
+        /* Mantieni advertising con state=OFF per 1s così scanner Pi Zero cattura */
+        uint8_t data[] = {
+            0x08, 0xFF, 0xFF, 0xFF,
+            RJ_BEACON_MAGIC0, RJ_BEACON_MAGIC1,
+            RJ_BEACON_MAGIC2, RJ_BEACON_MAGIC3,
+            RJ_BEACON_STATE_OFF
+        };
+        /* set_data non si può fare mentre attivo — stop, update, restart */
+        furi_check(furi_hal_bt_extra_beacon_stop());
+        furi_check(furi_hal_bt_extra_beacon_set_data(data, sizeof(data)));
+        furi_check(furi_hal_bt_extra_beacon_start());
+        furi_delay_ms(1000);  /* 1s continuous OFF advertising */
+        furi_check(furi_hal_bt_extra_beacon_stop());
+        /* logged by caller */
     }
 }
 
@@ -368,37 +381,15 @@ static void capture_reset(CaptureCtx* c) {
 
 /* ========== BOARD ESTERNA: jam on/off ========== */
 
-/* Jam via INTERNAL CC1101 (~15mW max, basso impatto su RX external) */
-static LevelDuration jam_internal_cb(void* ctx) {
-    RollJamApp* app = ctx;
-    if(app->should_abort) return level_duration_reset();
-    return level_duration_make(true, 500);  /* 500us HIGH continuous */
-}
-
+/* Jam delegato al Pi Zero remoto via beacon BLE — qui no-op radio.
+ * Il Flipper non TX nulla; conta solo i cicli per il display e il log. */
 static void jam_on(RollJamApp* app) {
     if(app->should_abort) return;
-    if(app->jam_count == 0) log_add("jam_on: reset");
-    furi_hal_subghz_reset();
-    if(app->jam_count == 0) log_add("jam_on: idle");
-    furi_hal_subghz_idle();
-    if(app->jam_count == 0) log_add("jam_on: regs");
-    furi_hal_subghz_load_registers(preset_ook_650_regs);
-    if(app->jam_count == 0) log_add("jam_on: patable");
-    furi_hal_subghz_load_patable(preset_patable);
-    if(app->jam_count == 0) log_add("jam_on: freq");
-    furi_hal_subghz_set_frequency_and_path(ROLLJAM_FREQ_JAM);
-    if(app->jam_count == 0) log_add("jam_on: async_tx");
-    if(furi_hal_subghz_start_async_tx(jam_internal_cb, app)) {
-        app->jam_count++;
-    } else if(app->jam_count == 0) {
-        log_add("jam_on: async_tx FAIL");
-    }
+    app->jam_count++;
 }
 
 static void jam_off(RollJamApp* app) {
     (void)app;
-    furi_hal_subghz_stop_async_tx();
-    furi_hal_subghz_idle();
 }
 
 /* ========== CC1101 INTERNO: RX on/off ========== */
