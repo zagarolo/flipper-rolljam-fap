@@ -105,7 +105,7 @@ static FuriHalSubGhzPreset preset_lookup(uint8_t i) {
 
 #define ROLLJAM_JAM_DURATION_MS 5
 #define ROLLJAM_RX_WINDOW_MS    60
-#define ROLLJAM_RX_EXTEND_MS    80
+#define ROLLJAM_RX_EXTEND_MS    400  /* 3x ripetizioni HCS300/Keeloq ≈ 335ms + margine */
 #define ROLLJAM_MAX_SESSION_MS  15000
 #define ROLLJAM_RX_MIN_EDGES    300
 #define ROLLJAM_MAX_TIMINGS     2048
@@ -690,11 +690,21 @@ static bool run_attack(RollJamApp* app) {
                 snprintf(buf, sizeof(buf), "TRIGGER edges=%lu",
                          (unsigned long)app->capture.edge_count);
                 log_add(buf);
+                /* Cattura dinamica: continua finché arrivano edges. Stop su silenzio 60ms. */
                 uint32_t t_ext = furi_get_tick();
-                while(furi_get_tick() - t_ext < ROLLJAM_RX_EXTEND_MS &&
+                uint32_t last_edges = app->capture.timings_len;
+                uint32_t t_last_edge = t_ext;
+                while(furi_get_tick() - t_ext < 1500 &&  /* safety cap 1.5s */
                       app->capture.timings_len < ROLLJAM_MAX_TIMINGS - 16) {
                     if(check_abort(app)) break;
                     furi_delay_ms(10);
+                    if(app->capture.timings_len > last_edges) {
+                        last_edges = app->capture.timings_len;
+                        t_last_edge = furi_get_tick();
+                    } else if(furi_get_tick() - t_last_edge > 60) {
+                        /* silenzio >60ms = pacchetto finito */
+                        break;
+                    }
                 }
                 break;
             }
@@ -778,8 +788,12 @@ static void do_replay(RollJamApp* app) {
 /* ---------- State machine ---------- */
 
 static void handle_key(RollJamApp* app, InputEvent* input) {
-    /* Solo Short (release) — debounce naturale, no doppio-trigger */
-    if(input->type != InputTypeShort) return;
+    /* Down → Press (istantaneo per replay). Altri → Short (debounce). */
+    if(input->key == InputKeyDown) {
+        if(input->type != InputTypePress) return;
+    } else {
+        if(input->type != InputTypeShort) return;
+    }
 
     switch(app->state) {
     case StateReady:
