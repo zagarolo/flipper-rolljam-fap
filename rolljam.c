@@ -701,7 +701,7 @@ static bool run_attack(RollJamApp* app) {
                     if(app->capture.timings_len > last_edges) {
                         last_edges = app->capture.timings_len;
                         t_last_edge = furi_get_tick();
-                    } else if(furi_get_tick() - t_last_edge > 60) {
+                    } else if(furi_get_tick() - t_last_edge > 15) {
                         /* silenzio >60ms = pacchetto finito */
                         break;
                     }
