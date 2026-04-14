@@ -30,7 +30,8 @@
 #define RJ_BEACON_MAGIC2 0x30  /* '0' */
 #define RJ_BEACON_MAGIC3 0x31  /* '1' */
 #define RJ_BEACON_STATE_OFF     0x00
-#define RJ_BEACON_STATE_ON_433  0x01
+#define RJ_BEACON_STATE_ON_433  0x01  /* OOK: jam = tune CW puro */
+#define RJ_BEACON_STATE_ON_FSK  0x03  /* FSK: jam = pichirp sweep 50kHz */
 #define RJ_BEACON_STATE_ON_868  0x02
 
 static void rj_beacon_set(uint8_t state) {
@@ -226,21 +227,24 @@ static void draw_cb(Canvas* canvas, void* ctx) {
 
     switch(app->state) {
     case StateReady:
-        canvas_draw_str_aligned(canvas, 64, 7, AlignCenter, AlignCenter, "ROLLJAM");
-        canvas_draw_line(canvas, 0, 12, 127, 12);
+        /* Header compatto */
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, PRESET_NAMES[app->preset_idx]);
+        canvas_draw_str_aligned(canvas, 64, 6, AlignCenter, AlignCenter, "ROLLJAM");
+        canvas_draw_line(canvas, 0, 11, 127, 11);
+        canvas_draw_str_aligned(canvas, 64, 18, AlignCenter, AlignCenter, PRESET_NAMES[app->preset_idx]);
         if(app->status_line[0] != '\0') {
-            canvas_draw_str_aligned(canvas, 64, 30, AlignCenter, AlignCenter, app->status_line);
+            canvas_draw_str_aligned(canvas, 64, 28, AlignCenter, AlignCenter, app->status_line);
         }
         if(app->total_slots > 0) {
             char r3[40];
             snprintf(r3, sizeof(r3), "slot %u/%u", app->current_slot, app->total_slots);
-            canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, r3);
+            canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, r3);
         }
-        canvas_draw_line(canvas, 0, 45, 127, 45);
-        canvas_draw_str_aligned(canvas, 64, 53, AlignCenter, AlignCenter, "OK jam+rx | v replay");
-        canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignCenter, "<>slot  ^preset");
+        canvas_draw_line(canvas, 0, 44, 127, 44);
+        /* Footer con font piccolo */
+        canvas_set_font(canvas, FontKeyboard);
+        canvas_draw_str_aligned(canvas, 64, 51, AlignCenter, AlignCenter, "OK jam | v replay");
+        canvas_draw_str_aligned(canvas, 64, 59, AlignCenter, AlignCenter, "<> slot   ^ preset");
         break;
 
     case StateRunning:
@@ -638,7 +642,9 @@ done:
 
 static bool run_attack(RollJamApp* app) {
     log_add("=== ATTACK START ===");
-    rj_beacon_set(RJ_BEACON_STATE_ON_433);
+    /* Byte beacon dipende da preset: OOK→CW tune, FSK→pichirp sweep */
+    uint8_t jam_state = (app->preset_idx >= 2) ? RJ_BEACON_STATE_ON_FSK : RJ_BEACON_STATE_ON_433;
+    rj_beacon_set(jam_state);
     log_add("BEACON ON_433 — warmup 2s pichirp");
     log_flush(g_log_storage);
     furi_delay_ms(2000);
@@ -772,6 +778,7 @@ static void do_replay(RollJamApp* app) {
 /* ---------- State machine ---------- */
 
 static void handle_key(RollJamApp* app, InputEvent* input) {
+    /* Solo Short (release) — debounce naturale, no doppio-trigger */
     if(input->type != InputTypeShort) return;
 
     switch(app->state) {
