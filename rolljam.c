@@ -690,21 +690,12 @@ static bool run_attack(RollJamApp* app) {
                 snprintf(buf, sizeof(buf), "TRIGGER edges=%lu",
                          (unsigned long)app->capture.edge_count);
                 log_add(buf);
-                /* Cattura dinamica: continua finché arrivano edges. Stop su silenzio 60ms. */
+                /* Cattura FISSA 500ms — garantita completa 3x ripetizioni keyfob */
                 uint32_t t_ext = furi_get_tick();
-                uint32_t last_edges = app->capture.timings_len;
-                uint32_t t_last_edge = t_ext;
-                while(furi_get_tick() - t_ext < 1500 &&  /* safety cap 1.5s */
+                while(furi_get_tick() - t_ext < 500 &&
                       app->capture.timings_len < ROLLJAM_MAX_TIMINGS - 16) {
                     if(check_abort(app)) break;
                     furi_delay_ms(10);
-                    if(app->capture.timings_len > last_edges) {
-                        last_edges = app->capture.timings_len;
-                        t_last_edge = furi_get_tick();
-                    } else if(furi_get_tick() - t_last_edge > 15) {
-                        /* silenzio >60ms = pacchetto finito */
-                        break;
-                    }
                 }
                 break;
             }
